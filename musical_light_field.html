@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sonic Light Field</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+            z-index: 10;
+        }
+
+        #start-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            pointer-events: auto;
+            z-index: 20;
+            backdrop-filter: blur(10px);
+            transition: opacity 0.5s;
+        }
+
+        button {
+            background: transparent;
+            color: #00ffff;
+            border: 2px solid #00ffff;
+            padding: 15px 40px;
+            font-size: 1.5rem;
+            font-family: inherit;
+            letter-spacing: 2px;
+            cursor: pointer;
+            text-transform: uppercase;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #00ffff;
+            color: #000;
+            box-shadow: 0 0 40px rgba(0, 255, 255, 0.6);
+        }
+
+        .hud-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+
+        h1 {
+            margin: 0;
+            font-weight: 200;
+            color: #fff;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            font-size: 1.5rem;
+        }
+
+        .status-panel {
+            text-align: right;
+        }
+
+        .metric {
+            font-size: 0.8rem;
+            color: #888;
+            margin-bottom: 5px;
+        }
+
+        .value {
+            color: #00ffff;
+            font-weight: bold;
+        }
+
+        #webcam {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 160px;
+            height: 120px;
+            opacity: 0.2;
+            transform: scaleX(-1);
+            border: 1px solid #333;
+            z-index: 5;
+        }
+
+        .controls-hint {
+            position: absolute;
+            bottom: 30px;
+            left: 30px;
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 0.8rem;
+            line-height: 1.5;
+            border-left: 2px solid #ff00ff;
+            padding-left: 15px;
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@100;300;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div id="start-overlay">
+        <h1 style="margin-bottom: 30px; font-size: 3rem; text-shadow: 0 0 30px #00ffff;">SONIC FIELD</h1>
+        <p style="color: #aaa; margin-bottom: 40px; max-width: 400px; text-align: center;">
+            Microphone access required for audio visualization.<br>
+            Camera access required for gesture control.
+        </p>
+        <button id="start-btn">INITIALIZE SYSTEM</button>
+    </div>
+
+    <div id="ui-layer">
+        <div class="hud-top">
+            <h1>AUDIO VISUALIZER // <span style="color:#ff00ff">NEON</span></h1>
+            <div class="status-panel">
+                <div class="metric">GAIN: <span id="val-gain" class="value">1.0</span></div>
+                <div class="metric">HUE: <span id="val-hue" class="value">180</span></div>
+                <div class="metric">DISTORTION: <span id="val-dist" class="value">OFF</span></div>
+            </div>
+        </div>
+        <div class="controls-hint">
+            <strong>CONTROLS</strong><br>
+            ↕️ HAND Y: Volume Sensitivity<br>
+            ↔️ HAND X: Color Shift<br>
+            👌 PINCH: Glitch / Distortion
+        </div>
+    </div>
+
+    <video id="webcam" autoplay playsinline muted></video>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+        // --- CONFIG ---
+        const GRID_SIZE = 64; // 64x64 grid
+        const SEPARATION = 0.8;
+        const PARTICLE_COUNT = GRID_SIZE * GRID_SIZE;
+
+        // --- STATE ---
+        const state = {
+            running: false,
+            audioContext: null,
+            analyser: null,
+            dataArray: null,
+            hand: {
+                active: false,
+                x: 0.5, // 0 to 1
+                y: 0.5, // 0 to 1
+                pinching: false
+            }
+        };
+
+        // --- SCENE ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.04); // Volumetric feel
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 20, 40);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // --- POST PROCESSING ---
+        const composer = new EffectComposer(renderer);
+        const renderPass = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0.1;
+        bloomPass.strength = 2.5; // Strong neon glow
+        bloomPass.radius = 0.5;
+
+        composer.addPass(renderPass);
+        composer.addPass(bloomPass);
+
+        // --- PARTICLES ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const colors = new Float32Array(PARTICLE_COUNT * 3);
+        const baseY = new Float32Array(PARTICLE_COUNT); // Store base Y to reset
+
+        // Create Grid
+        let idx = 0;
+        const offset = (GRID_SIZE * SEPARATION) / 2;
+
+        for (let x = 0; x < GRID_SIZE; x++) {
+            for (let z = 0; z < GRID_SIZE; z++) {
+                const px = x * SEPARATION - offset;
+                const pz = z * SEPARATION - offset;
+                const py = 0;
+
+                positions[idx * 3] = px;
+                positions[idx * 3 + 1] = py;
+                positions[idx * 3 + 2] = pz;
+
+                baseY[idx] = py;
+
+                // Initial color (Cyan)
+                colors[idx * 3] = 0;
+                colors[idx * 3 + 1] = 1;
+                colors[idx * 3 + 2] = 1;
+
+                idx++;
+            }
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        // Texture for soft particle
+        const getTexture = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 32, 32);
+            return new THREE.Texture(canvas);
+        };
+        const tex = getTexture();
+        tex.needsUpdate = true;
+
+        const material = new THREE.PointsMaterial({
+            size: 0.5,
+            map: tex,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.9
+        });
+
+        const particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        // --- AUDIO SETUP ---
+        const setupAudio = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                state.analyser = state.audioContext.createAnalyser();
+                const source = state.audioContext.createMediaStreamSource(stream);
+
+                source.connect(state.analyser);
+                state.analyser.fftSize = 256; // 128 data points
+                const bufferLength = state.analyser.frequencyBinCount;
+                state.dataArray = new Uint8Array(bufferLength);
+                return true;
+            } catch (e) {
+                console.error("Audio Error:", e);
+                alert("Microphone access denied. Visualization will be silent.");
+                return false;
+            }
+        };
+
+        // --- VISION SETUP ---
+        let handLandmarker = undefined;
+        const video = document.getElementById("webcam");
+        let lastVideoTime = -1;
+
+        const setupVision = async () => {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = stream;
+        };
+
+        // --- MAIN LOOP ---
+        const clock = new THREE.Clock();
+
+        const animate = () => {
+            requestAnimationFrame(animate);
+
+            const time = clock.getElapsedTime();
+            const posAttr = geometry.attributes.position;
+            const colAttr = geometry.attributes.color;
+
+            // 1. Process Audio
+            let freqData = [];
+            if (state.analyser) {
+                state.analyser.getByteFrequencyData(state.dataArray);
+                freqData = state.dataArray;
+            }
+
+            // 2. Process Hand
+            if (handLandmarker && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                const results = handLandmarker.detectForVideo(video, performance.now());
+                if (results.landmarks.length > 0) {
+                    state.hand.active = true;
+                    const lm = results.landmarks[0];
+                    const index = lm[8];
+                    const thumb = lm[4];
+
+                    // Update State
+                    state.hand.x = 1 - index.x; // Mirror
+                    state.hand.y = 1 - index.y; // Invert so up is up
+
+                    const pinch = Math.hypot(index.x - thumb.x, index.y - thumb.y);
+                    state.hand.pinching = pinch < 0.05;
+                } else {
+                    state.hand.active = false;
+                    // Decay to default
+                    state.hand.x += (0.5 - state.hand.x) * 0.05;
+                    state.hand.y += (0.5 - state.hand.y) * 0.05;
+                    state.hand.pinching = false;
+                }
+            }
+
+            // UI Updates
+            const gain = 0.5 + (state.hand.y * 2.5); // 0.5x to 3.0x
+            const hueBase = state.hand.x; // 0 to 1
+
+            document.getElementById('val-gain').innerText = gain.toFixed(2);
+            document.getElementById('val-hue').innerText = Math.floor(hueBase * 360);
+            document.getElementById('val-dist').innerText = state.hand.pinching ? "ACTIVE" : "OFF";
+            document.getElementById('val-dist').style.color = state.hand.pinching ? "#ff0055" : "#888";
+
+            // 3. Update Particles
+            let idx = 0;
+            for (let x = 0; x < GRID_SIZE; x++) {
+                // Map grid X to Frequency Index
+                // We have 128 bins. Grid is 64. 
+                // Let's use lower frequencies for center, higher for edges? 
+                // Or just simple linear mapping.
+                const freqIndex = Math.floor((x / GRID_SIZE) * (freqData.length || 0) * 0.8); // Use lower 80% of spectrum
+                const audioVal = freqData[freqIndex] || 0;
+
+                // Normalized Audio (0 to 1)
+                const nAudio = audioVal / 255.0;
+
+                for (let z = 0; z < GRID_SIZE; z++) {
+                    // Calculate Height
+                    // Base wave + Audio boost
+                    let h = Math.sin(x * 0.2 + time) * Math.cos(z * 0.2 + time) * 2; // Idle wave
+
+                    // Audio reaction
+                    // Center Z reacts more? Or just uniform bars?
+                    // Let's make it look like a rolling landscape
+                    h += nAudio * 15 * gain;
+
+                    // Distortion (Pinch)
+                    if (state.hand.pinching) {
+                        h += (Math.random() - 0.5) * 5 * nAudio; // Glitch effect
+                    }
+
+                    // Apply to Y
+                    posAttr.array[idx * 3 + 1] += (h - posAttr.array[idx * 3 + 1]) * 0.2; // Smooth transition
+
+                    // Color Calculation
+                    // Hue based on Hand X + Audio Intensity
+                    const hue = (hueBase + (nAudio * 0.2) + (z / GRID_SIZE) * 0.1) % 1.0;
+                    const sat = 1.0;
+                    const light = 0.5 + nAudio * 0.5; // Brighter when loud
+
+                    const color = new THREE.Color().setHSL(hue, sat, light);
+
+                    colAttr.array[idx * 3] = color.r;
+                    colAttr.array[idx * 3 + 1] = color.g;
+                    colAttr.array[idx * 3 + 2] = color.b;
+
+                    idx++;
+                }
+            }
+
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+
+            // Camera gentle float
+            camera.position.x = Math.sin(time * 0.2) * 5;
+            camera.lookAt(0, 0, 0);
+
+            composer.render();
+        };
+
+        // --- INITIALIZATION ---
+        document.getElementById('start-btn').addEventListener('click', async () => {
+            document.getElementById('start-btn').innerText = "CONNECTING...";
+            await setupAudio();
+            await setupVision();
+
+            document.getElementById('start-overlay').style.opacity = 0;
+            setTimeout(() => {
+                document.getElementById('start-overlay').style.display = 'none';
+            }, 500);
+
+            state.running = true;
+            animate();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+
+</html>

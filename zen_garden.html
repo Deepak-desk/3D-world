@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zen Garden</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #e0e0e0;
+            /* Soft grey background */
+            font-family: 'Outfit', sans-serif;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 40px;
+            box-sizing: border-box;
+            z-index: 10;
+        }
+
+        h1 {
+            font-weight: 200;
+            letter-spacing: 8px;
+            margin: 0;
+            color: #555;
+            text-transform: uppercase;
+            font-size: 1.2rem;
+            opacity: 0.8;
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            background-color: #aaa;
+            border-radius: 50%;
+            margin-right: 10px;
+            transition: background-color 0.5s;
+        }
+
+        .status-indicator.active {
+            background-color: #555;
+        }
+
+        .status-row {
+            display: flex;
+            align-items: center;
+            margin-top: 10px;
+            font-size: 0.8rem;
+            color: #888;
+        }
+
+        #webcam {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 120px;
+            height: 90px;
+            opacity: 0.1;
+            transform: scaleX(-1);
+            border-radius: 10px;
+            z-index: 5;
+            transition: opacity 0.3s;
+        }
+
+        #webcam:hover {
+            opacity: 0.8;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #888;
+            font-weight: 300;
+            letter-spacing: 2px;
+        }
+
+        .instruction {
+            text-align: center;
+            color: #888;
+            font-size: 0.9rem;
+            letter-spacing: 1px;
+            opacity: 0.6;
+            margin-bottom: 20px;
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@100;300&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div id="ui-layer">
+        <div>
+            <h1>Zen Garden</h1>
+            <div class="status-row">
+                <div id="status-dot" class="status-indicator"></div>
+                <span id="status-text">Waiting for presence...</span>
+            </div>
+        </div>
+        <div class="instruction">
+            Drag to Rake &nbsp; • &nbsp; Pinch to Place Stone
+        </div>
+    </div>
+
+    <div id="loading">Initializing Peace...</div>
+    <video id="webcam" autoplay playsinline muted></video>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+        // --- CONFIG ---
+        const SAND_COLOR = 0xf0f0f0;
+        const SHADOW_COLOR = 0xd0d0d0;
+        const STONE_COLOR = 0x555555;
+        const GRID_SIZE = 200; // Resolution of sand
+        const PLANE_SIZE = 40;
+
+        // --- STATE ---
+        const state = {
+            handActive: false,
+            handPos: new THREE.Vector2(), // 0-1 range
+            isPinching: false,
+            stones: [] // Array of stone objects
+        };
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xe0e0e0);
+        scene.fog = new THREE.FogExp2(0xe0e0e0, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 25, 20);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.SoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -25;
+        dirLight.shadow.camera.right = 25;
+        dirLight.shadow.camera.top = 25;
+        dirLight.shadow.camera.bottom = -25;
+        scene.add(dirLight);
+
+        // --- DISPLACEMENT MAP (CANVAS) ---
+        // This canvas stores the height information. 
+        // White = High (Ridge), Black = Low (Furrow)
+        const heightCanvas = document.createElement('canvas');
+        heightCanvas.width = 512;
+        heightCanvas.height = 512;
+        const ctx = heightCanvas.getContext('2d');
+
+        // Initialize with neutral grey
+        ctx.fillStyle = '#808080';
+        ctx.fillRect(0, 0, 512, 512);
+
+        const heightTexture = new THREE.CanvasTexture(heightCanvas);
+
+        // --- SAND MESH ---
+        // We use a high-segment plane to show displacement
+        const geometry = new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE, GRID_SIZE, GRID_SIZE);
+        geometry.rotateX(-Math.PI / 2);
+
+        // Custom Shader Material for Sand
+        // We want soft shading based on the height map
+        const material = new THREE.MeshStandardMaterial({
+            color: SAND_COLOR,
+            displacementMap: heightTexture,
+            displacementScale: 2.0,
+            roughness: 0.9,
+            metalness: 0.1,
+            flatShading: false
+        });
+
+        const sand = new THREE.Mesh(geometry, material);
+        sand.receiveShadow = true;
+        scene.add(sand);
+
+        // --- STONES ---
+        const stoneGeo = new THREE.DodecahedronGeometry(1, 0); // Low poly look
+        const stoneMat = new THREE.MeshStandardMaterial({
+            color: STONE_COLOR,
+            roughness: 0.8,
+            flatShading: true
+        });
+
+        const addStone = (x, z) => {
+            // Check if stone exists nearby
+            for (let s of state.stones) {
+                const dx = s.position.x - x;
+                const dz = s.position.z - z;
+                if (Math.hypot(dx, dz) < 3) return; // Too close
+            }
+
+            const stone = new THREE.Mesh(stoneGeo, stoneMat);
+
+            // Randomize stone shape slightly
+            stone.scale.set(
+                0.8 + Math.random() * 0.4,
+                0.6 + Math.random() * 0.4,
+                0.8 + Math.random() * 0.4
+            );
+
+            stone.position.set(x, 0.5, z);
+            stone.castShadow = true;
+            stone.receiveShadow = true;
+
+            // Pop in animation
+            stone.scale.multiplyScalar(0.1);
+            stone.userData.targetScale = 1.0;
+
+            scene.add(stone);
+            state.stones.push(stone);
+
+            // Draw permanent ripple in canvas
+            drawRipple(x, z);
+        };
+
+        // --- DRAWING LOGIC ---
+        const drawRipple = (worldX, worldZ) => {
+            // Convert World Coords to Canvas Coords
+            // World: -20 to 20 -> Canvas: 0 to 512
+            const cx = ((worldX + PLANE_SIZE / 2) / PLANE_SIZE) * 512;
+            const cy = ((worldZ + PLANE_SIZE / 2) / PLANE_SIZE) * 512;
+
+            ctx.beginPath();
+            ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+            ctx.strokeStyle = '#ffffff'; // High ridge
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(cx, cy, 30, 0, Math.PI * 2);
+            ctx.strokeStyle = '#404040'; // Low furrow
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        };
+
+        const updateCanvas = () => {
+            // 1. Fade out slowly (Reset sand)
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.fillStyle = 'rgba(128, 128, 128, 0.005)'; // Very slow reset to neutral grey
+            ctx.fillRect(0, 0, 512, 512);
+
+            // 2. Draw Rake
+            if (state.handActive && !state.isPinching) {
+                const cx = state.handPos.x * 512;
+                const cy = state.handPos.y * 512;
+
+                // Draw "Rake" lines
+                ctx.globalCompositeOperation = 'overlay'; // Blend with existing waves
+
+                // We draw a gradient circle to create a smooth groove
+                const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 25);
+                grad.addColorStop(0, '#404040'); // Deep center
+                grad.addColorStop(0.5, '#808080'); // Neutral
+                grad.addColorStop(1, '#ffffff'); // High edge
+
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.arc(cx, cy, 25, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // 3. Keep Ripples around stones
+            // We need to redraw stone ripples occasionally or they fade
+            // Actually, let's just let them fade and user has to maintain them? 
+            // No, Zen gardens have static rocks.
+            // Let's redraw stone ripples every frame but faintly
+            ctx.globalCompositeOperation = 'overlay';
+            state.stones.forEach(stone => {
+                const cx = ((stone.position.x + PLANE_SIZE / 2) / PLANE_SIZE) * 512;
+                const cy = ((stone.position.z + PLANE_SIZE / 2) / PLANE_SIZE) * 512;
+
+                // Simple concentric rings
+                for (let r = 20; r < 60; r += 10) {
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                    ctx.strokeStyle = (r % 20 === 0) ? '#ffffff' : '#404040';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            });
+
+            heightTexture.needsUpdate = true;
+        };
+
+        // --- AI SETUP ---
+        const video = document.getElementById("webcam");
+        const statusDot = document.getElementById("status-dot");
+        const statusText = document.getElementById("status-text");
+        let handLandmarker = undefined;
+        let lastVideoTime = -1;
+
+        const setupAI = async () => {
+            const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            document.getElementById("loading").style.display = "none";
+
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = stream;
+        };
+        setupAI();
+
+        // --- LOOP ---
+        const clock = new THREE.Clock();
+
+        const tick = () => {
+            const dt = clock.getDelta();
+
+            // 1. Hand Tracking
+            if (handLandmarker && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                const results = handLandmarker.detectForVideo(video, performance.now());
+
+                if (results.landmarks.length > 0) {
+                    const lm = results.landmarks[0];
+                    const index = lm[8];
+                    const thumb = lm[4];
+
+                    // Map to Canvas Coords (0-1)
+                    // Mirror X
+                    const tx = 1 - index.x;
+                    const ty = index.y; // Canvas Y is top-down, same as video Y usually? 
+                    // Actually video Y is top-down. 3D Z is top-down in our mapping?
+                    // Let's map video Y (0 top, 1 bottom) to Texture Y (0 top, 1 bottom).
+
+                    // Smooth interpolation
+                    state.handPos.x += (tx - state.handPos.x) * 0.1;
+                    state.handPos.y += (ty - state.handPos.y) * 0.1;
+
+                    state.handActive = true;
+                    statusDot.classList.add('active');
+                    statusText.innerText = "Connected";
+
+                    // Pinch Detection
+                    const pinch = Math.hypot(index.x - thumb.x, index.y - thumb.y);
+                    if (pinch < 0.05) {
+                        if (!state.isPinching) {
+                            // Trigger Stone Placement
+                            // Convert 0-1 to World Coords
+                            const wx = (state.handPos.x * PLANE_SIZE) - PLANE_SIZE / 2;
+                            const wz = (state.handPos.y * PLANE_SIZE) - PLANE_SIZE / 2;
+                            addStone(wx, wz);
+                        }
+                        state.isPinching = true;
+                    } else {
+                        state.isPinching = false;
+                    }
+
+                } else {
+                    state.handActive = false;
+                    statusDot.classList.remove('active');
+                    statusText.innerText = "Waiting for presence...";
+                }
+            }
+
+            // 2. Update Canvas (Sand Physics)
+            updateCanvas();
+
+            // 3. Animate Stones
+            state.stones.forEach(stone => {
+                // Pop-in effect
+                if (stone.scale.x < 1) {
+                    stone.scale.addScalar(dt * 2);
+                }
+            });
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(tick);
+        };
+
+        tick();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+
+</html>
